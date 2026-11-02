@@ -1,0 +1,353 @@
+//Mini Weather Station and EYE animation using ESP32 C3 Mini and OLED display
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "esp_wifi.h"
+#include "time.h"
+// ---------------- സെറ്റിംഗ്സുകൾ (നിങ്ങളുടെ വിവരങ്ങൾ നൽകുക) ----------------
+const char* ssid     = "XXXXXXXx";             // Wi-Fi പേര്
+const char* password = "XXXXXX";    // Wi-Fi പാസ്‌വേഡ്
+
+String openWeatherMapApiKey = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXX";   // OpenWeatherMap API Key
+String city = "XXXXXXXXX";                         // നിങ്ങളുടെ നഗരത്തിന്റെ പേര്
+String countryCode = "IN";                      // Country Code
+#define TOUCH_PIN 4                             // TTP223 SIG Pin -> GPIO 4
+
+// ---------------- OLED Display Settings ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------------- NTP Time Settings ----------------
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 19800; // India Time (GMT +5:30)
+const int   daylightOffset_sec = 0;
+
+unsigned long lastWeatherUpdate = 0;
+const unsigned long weatherInterval = 600000; 
+
+// Weather Data variables
+String tempStr = "28"; 
+String humidityStr = "73%";
+String weatherDesc = "Clouds";
+
+struct Forecast {
+  String dayStr;
+  String tempVal;
+  String mainCondition;
+};
+Forecast forecastData[3];
+
+int currentMode = 0; 
+int lastTouchState = LOW;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 300;
+
+// ------------ Weather Icons ------------
+void drawSunIcon(int x, int y) {
+  display.drawCircle(x + 6, y + 6, 4, SSD1306_WHITE);
+  display.drawLine(x + 6, y, x + 6, y + 2, SSD1306_WHITE);
+  display.drawLine(x + 6, y + 10, x + 6, y + 12, SSD1306_WHITE);
+  display.drawLine(x, y + 6, x + 2, y + 6, SSD1306_WHITE);
+  display.drawLine(x + 10, y + 6, x + 12, y + 6, SSD1306_WHITE);
+}
+
+void drawCloudIcon(int x, int y) {
+  display.fillCircle(x + 4, y + 8, 3, SSD1306_WHITE);
+  display.fillCircle(x + 8, y + 7, 4, SSD1306_WHITE);
+  display.fillCircle(x + 9, y + 9, 3, SSD1306_WHITE);
+  display.fillRect(x + 3, y + 8, 8, 4, SSD1306_WHITE);
+}
+
+void drawRainIcon(int x, int y) {
+  drawCloudIcon(x, y);
+  display.drawLine(x + 3, y + 12, x + 2, y + 14, SSD1306_WHITE);
+  display.drawLine(x + 7, y + 12, x + 6, y + 14, SSD1306_WHITE);
+  display.drawLine(x + 10, y + 12, x + 9, y + 14, SSD1306_WHITE);
+}
+
+void drawWeatherSymbol(int x, int y, String desc) {
+  if (desc.equalsIgnoreCase("Clear") || desc.equalsIgnoreCase("Sun")) {
+    drawSunIcon(x, y);
+  } else if (desc.equalsIgnoreCase("Rain") || desc.equalsIgnoreCase("Drizzle") || desc.equalsIgnoreCase("Thunderstorm")) {
+    drawRainIcon(x, y);
+  } else {
+    drawCloudIcon(x, y);
+  }
+}
+
+// ------------ Helper Function for Clean Small Degree Symbol ------------
+void printFormattedTemp(int val, int textSize) {
+  display.setTextSize(textSize);
+  display.print(val);
+  
+  int x = display.getCursorX();
+  int y = display.getCursorY();
+  
+  if (textSize == 2) {
+    // Large temp display (Mode 2) - Custom small clean degree circle
+    display.drawCircle(x + 3, y + 3, 2, SSD1306_WHITE);
+    display.setCursor(x + 8, y);
+  } else {
+    // Normal temp display (Mode 0 & 1)
+    display.drawCircle(x + 2, y + 1, 1, SSD1306_WHITE);
+    display.setCursor(x + 5, y);
+  }
+  display.print("C");
+}
+
+// ------------ Fetch Weather API ------------
+void fetchWeather() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String currentPath = "http://api.openweathermap.org/data/2.5/weather?q=" + city + "," + countryCode + "&appid=" + openWeatherMapApiKey + "&units=metric";
+    http.setTimeout(5000);
+    http.begin(currentPath);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(1024);
+      deserializeJson(doc, payload);
+      float t = doc["main"]["temp"];
+      int h = doc["main"]["humidity"];
+      const char* desc = doc["weather"][0]["main"];
+      
+      tempStr = String((int)t); 
+      humidityStr = String(h) + "%";
+      weatherDesc = String(desc);
+    }
+    http.end();
+
+    String forecastPath = "http://api.openweathermap.org/data/2.5/forecast?q=" + city + "," + countryCode + "&appid=" + openWeatherMapApiKey + "&units=metric";
+    http.begin(forecastPath);
+    httpCode = http.GET();
+    if (httpCode > 0) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(4096);
+      deserializeJson(doc, payload);
+
+      int indices[3] = {0, 8, 16};
+      for (int i = 0; i < 3; i++) {
+        int idx = indices[i];
+        time_t forecastTime = doc["list"][idx]["dt"];
+        struct tm* f_info = localtime(&forecastTime);
+        char dayBuffer[10];
+        strftime(dayBuffer, sizeof(dayBuffer), "%a", f_info);
+
+        float tAvg = doc["list"][idx]["main"]["temp"];
+        const char* mainCond = doc["list"][idx]["weather"][0]["main"];
+        
+        forecastData[i].dayStr = String(dayBuffer);
+        forecastData[i].tempVal = String((int)tAvg);
+        forecastData[i].mainCondition = String(mainCond);
+      }
+    }
+    http.end();
+  }
+}
+
+// ------------ Mode 0: Main Clock ------------
+void renderMainClockScreen(struct tm timeinfo) {
+  display.setTextSize(1);
+  // Bold Effect for City Name
+  display.setCursor(0, 2);
+  display.print(city);
+  display.setCursor(1, 2);
+  display.print(city);
+  
+  drawWeatherSymbol(110, 0, weatherDesc);
+  display.drawLine(0, 14, 128, 14, SSD1306_WHITE);
+
+  bool showColon = (millis() / 500) % 2 == 0;
+  char timeStr[15];
+  if (showColon) {
+    strftime(timeStr, sizeof(timeStr), "%I:%M %p", &timeinfo);
+  } else {
+    strftime(timeStr, sizeof(timeStr), "%I %M %p", &timeinfo);
+  }
+  
+  display.setTextSize(2);
+  display.setCursor(12, 19);
+  display.println(timeStr);
+
+  char dateStr[20];
+  strftime(dateStr, sizeof(dateStr), "%d %b %Y", &timeinfo);
+  display.setTextSize(1);
+  display.setCursor(25, 38);
+  display.println(dateStr);
+  display.drawLine(0, 48, 128, 48, SSD1306_WHITE);
+
+  display.setCursor(2, 53);
+  display.print("Temp:");
+  printFormattedTemp(tempStr.toInt(), 1);
+  display.print(" | Hum:");
+  display.print(humidityStr);
+}
+
+// ------------ Mode 1: Forecast ------------
+void renderForecastScreen() {
+  int colWidth = 42;
+  for (int i = 0; i < 3; i++) {
+    int startX = i * colWidth;
+
+    if (i == 0) {
+      display.drawRoundRect(startX + 1, 0, colWidth - 2, 64, 3, SSD1306_WHITE);
+    }
+
+    display.setTextSize(1);
+    display.setCursor(startX + 8, 6);
+    display.print(forecastData[i].dayStr);
+
+    drawWeatherSymbol(startX + 14, 22, forecastData[i].mainCondition);
+
+    display.setCursor(startX + 4, 45);
+    printFormattedTemp(forecastData[i].tempVal.toInt(), 1);
+
+    if (i < 2) {
+      display.drawLine(startX + colWidth, 0, startX + colWidth, 64, SSD1306_WHITE);
+    }
+  }
+}
+
+// ------------ Mode 2: Location Weather Summary ------------
+void renderLocationWeatherScreen() {
+  display.setTextSize(1);
+  display.setCursor(2, 4);
+  display.print("Loc: ");
+  display.print(city);
+  display.drawLine(0, 15, 128, 15, SSD1306_WHITE);
+
+  drawWeatherSymbol(8, 26, weatherDesc);
+
+  display.setTextSize(2);
+  display.setCursor(32, 22);
+  //display.print(tempStr);
+  // Big Temperature Display with Clean Small Degree Symbol
+  printFormattedTemp(tempStr.toInt(), 2);
+  // Reset cursor for humidity position correctly
+  display.setTextSize(1);
+  display.setCursor(90, 20);
+  display.print("Hum:");
+  display.setCursor(90, 30);
+  display.print(humidityStr);
+
+  display.drawLine(0, 48, 128, 48, SSD1306_WHITE);
+  
+  display.setCursor(6, 53);
+  display.print("Status: ");
+  display.print(weatherDesc);
+}
+
+// ------------ Mode 3: Cute Robot Face ------------
+void renderRobotFaceScreen() {
+  int leftEyeX = 26, rightEyeX = 78, eyeY = 16;
+  int eyeW = 24, eyeH = 24;
+
+  int emotionState = (millis() / 3000) % 3; 
+  bool blinking = ((millis() / 2000) % 5) == 0;
+
+  if (blinking) {
+    display.fillRect(leftEyeX, eyeY + 10, eyeW, 4, SSD1306_WHITE);
+    display.fillRect(rightEyeX, eyeY + 10, eyeW, 4, SSD1306_WHITE);
+  } 
+  else if (emotionState == 1) {
+    display.drawCircle(leftEyeX + 12, eyeY + 12, 10, SSD1306_WHITE);
+    display.fillRect(leftEyeX, eyeY, eyeW, 10, SSD1306_BLACK);
+    
+    display.drawCircle(rightEyeX + 12, eyeY + 12, 10, SSD1306_WHITE);
+    display.fillRect(rightEyeX, eyeY, eyeW, 10, SSD1306_BLACK);
+  } 
+  else {
+    display.fillRoundRect(leftEyeX, eyeY, eyeW, eyeH, 6, SSD1306_WHITE);
+    display.fillRoundRect(rightEyeX, eyeY, eyeW, eyeH, 6, SSD1306_WHITE);
+
+    int lookDir = (millis() / 1500) % 3;
+    int pupilOffsetX = 6;
+    if (lookDir == 1) pupilOffsetX = 12;
+    else if (lookDir == 2) pupilOffsetX = 2;
+
+    display.fillCircle(leftEyeX + pupilOffsetX + 3, eyeY + 12, 5, SSD1306_BLACK);
+    display.fillCircle(rightEyeX + pupilOffsetX + 3, eyeY + 12, 5, SSD1306_BLACK);
+  }
+
+  int mouthX = 64, mouthY = 48;
+  if (emotionState == 1) {
+    display.fillCircle(mouthX, mouthY, 8, SSD1306_WHITE);
+    display.fillCircle(mouthX, mouthY - 4, 7, SSD1306_BLACK);
+  } else {
+    display.drawCircle(mouthX, mouthY, 9, SSD1306_WHITE);
+    display.fillRect(mouthX - 12, mouthY - 9, 24, 9, SSD1306_BLACK);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  pinMode(TOUCH_PIN, INPUT);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for(;;);
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.println("Connecting WiFi...");
+  display.display();
+
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(500);
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_max_tx_power(WIFI_POWER_8_5dBm); 
+
+  WiFi.begin(ssid, password);
+  
+  int counter = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    counter++;
+    if (counter > 40) break;
+  }
+  
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  fetchWeather();
+}
+
+void loop() {
+  int touchVal = digitalRead(TOUCH_PIN);
+  if (touchVal == HIGH && lastTouchState == LOW && (millis() - lastDebounceTime > debounceDelay)) {
+    currentMode = (currentMode + 1) % 4; 
+    lastDebounceTime = millis();
+  }
+  lastTouchState = touchVal;
+
+  if (millis() - lastWeatherUpdate > weatherInterval) {
+    fetchWeather();
+    lastWeatherUpdate = millis();
+  }
+
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+
+  display.clearDisplay();
+
+  if (currentMode == 0) {
+    renderMainClockScreen(timeinfo);
+  } else if (currentMode == 1) {
+    renderForecastScreen();       
+  } else if (currentMode == 2) {
+    renderLocationWeatherScreen();
+  } else if (currentMode == 3) {
+    renderRobotFaceScreen();      
+  }
+
+  display.display();
+  delay(50);
+}
